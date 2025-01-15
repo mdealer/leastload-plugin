@@ -24,7 +24,7 @@
 package org.bstick12.jenkinsci.plugins.leastload;
 
 import com.google.common.base.Preconditions;
-import edu.umd.cs.findbugs.annotations.CheckForNull;
+import com.google.common.collect.Maps;import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.init.Initializer;
 import hudson.model.Computer;
@@ -38,12 +38,9 @@ import hudson.model.queue.MappingWorksheet.Mapping;
 import hudson.model.queue.SubTask;
 
 import java.io.Serializable;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.List;
-import java.util.logging.Logger;
-import jenkins.model.Jenkins;
+import java.util.*;
+import java.util.logging.Level;import java.util.logging.Logger;
+import hudson.util.ConsistentHash;import jenkins.model.Jenkins;
 
 import static java.util.logging.Level.FINE;
 import static java.util.logging.Level.WARNING;
@@ -91,10 +88,27 @@ public class LeastLoadBalancer extends LoadBalancer {
 
             if (!isDisabled(task)) {
 
-                List<ExecutorChunk> useableChunks = getApplicableSortedByLoad(ws);
+                // build consistent hash for each work chunk
+                List<ConsistentHash<ExecutorChunk>> hashes = new ArrayList<>(ws.works.size());
+                for (int i = 0; i < ws.works.size(); i++) {
+                    ConsistentHash<ExecutorChunk> hash = new ConsistentHash<>(ExecutorChunk::getName);
+
+                    // Build a Map to pass in rather than repeatedly calling hash.add() because each call does lots of expensive work
+                    List<ExecutorChunk> chunks = ws.works(i).applicableExecutorChunks();
+                    Map<ExecutorChunk, Integer> toAdd = Maps.newHashMapWithExpectedSize(chunks.size());
+                    for (ExecutorChunk ec : chunks) {
+                        toAdd.put(ec, ec.size() * 100);
+                    }
+                    hash.addAll(toAdd);
+
+                    hashes.add(hash);
+                }
+
                 // do a greedy assignment
                 Mapping m = ws.new Mapping();
-                if (assignGreedily(m, useableChunks, 0)) {
+                assert m.size() == ws.works.size();   // just so that you the reader of the source code don't get confused with the for loop index
+
+                if (assignGreedily(m, task, hashes, 0)) {
                     assert m.isCompletelyValid();
                     return m;
                 } else {
@@ -149,20 +163,25 @@ public class LeastLoadBalancer extends LoadBalancer {
 
     }
 
-    private boolean assignGreedily(Mapping m, List<ExecutorChunk> executors, int i) {
+    private boolean assignGreedily(Mapping m, Task task, List<ConsistentHash<ExecutorChunk>> hashes, int i) {
+        if (i == hashes.size())   return true;    // fully assigned
 
-        // fully assigned
-        if (m.size() == i) {
-            return true;
+        String key;
+        try {
+            key = task.getAffinityKey();
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.FINE, null, e);
+            // Default implementation of Queue.Task.getAffinityKey, we assume it doesn't fail.
+            key = task.getFullDisplayName();
         }
+        key += i > 0 ? String.valueOf(i) : "";
 
-        for (ExecutorChunk ec : executors) {
+        for (ExecutorChunk ec : hashes.get(i).list(key)) {
             // let's attempt this assignment
             m.assign(i, ec);
-            if (m.isPartiallyValid() && assignGreedily(m, executors, i + 1)) {
-                // successful greedily allocation
-                return true;
-            }
+
+            if (m.isPartiallyValid() && assignGreedily(m, task, hashes, i + 1))
+                return true;    // successful greedily allocation
 
             // otherwise 'ec' wasn't a good fit for us. try next.
         }
@@ -170,7 +189,6 @@ public class LeastLoadBalancer extends LoadBalancer {
         // every attempt failed
         m.assign(i, null);
         return false;
-
     }
 
     /**
