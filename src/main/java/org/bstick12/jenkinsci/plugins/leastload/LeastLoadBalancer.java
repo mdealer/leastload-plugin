@@ -39,8 +39,13 @@ import hudson.model.queue.SubTask;
 
 import java.io.Serializable;
 import java.util.*;
-import java.util.logging.Level;import java.util.logging.Logger;
-import hudson.util.ConsistentHash;import jenkins.model.Jenkins;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.stream.Collectors;
+import hudson.util.ConsistentHash;
+import jenkins.model.Jenkins;
+import jenkins.util.SystemProperties;
+import org.apache.tools.ant.taskdefs.Exec;
 
 import static java.util.logging.Level.FINE;
 import static java.util.logging.Level.WARNING;
@@ -58,10 +63,8 @@ import static java.util.logging.Level.WARNING;
 public class LeastLoadBalancer extends LoadBalancer {
 
     private static final Logger LOGGER = Logger.getLogger(LeastLoadBalancer.class.getName());
-
-    private static final Comparator<ExecutorChunk> EXECUTOR_CHUNK_COMPARATOR = Collections.reverseOrder(new ExecutorChunkComparator());
-
     private final LoadBalancer fallback;
+    public static boolean IS_ENABLED = SystemProperties.getBoolean(LeastLoadBalancer.class.getName() + ".IS_ENABLED", true);
 
     /**
      * Create the {@link LeastLoadBalancer} with a fallback that will be
@@ -83,37 +86,15 @@ public class LeastLoadBalancer extends LoadBalancer {
     @Override
     @CheckForNull
     public Mapping map(@NonNull Task task, MappingWorksheet ws) {
-
         try {
-
-            if (!isDisabled(task)) {
-
-                // build consistent hash for each work chunk
-                List<ConsistentHash<ExecutorChunk>> hashes = new ArrayList<>(ws.works.size());
-                for (int i = 0; i < ws.works.size(); i++) {
-                    ConsistentHash<ExecutorChunk> hash = new ConsistentHash<>(ExecutorChunk::getName);
-
-                    // Build a Map to pass in rather than repeatedly calling hash.add() because each call does lots of expensive work
-                    List<ExecutorChunk> chunks = ws.works(i).applicableExecutorChunks();
-                    Map<ExecutorChunk, Integer> toAdd = Maps.newHashMapWithExpectedSize(chunks.size());
-                    for (ExecutorChunk ec : chunks) {
-                        toAdd.put(ec, ec.size() * 100);
-                    }
-                    hash.addAll(toAdd);
-
-                    hashes.add(hash);
-                }
-
-                // do a greedy assignment
+            if (IS_ENABLED && !isDisabled(task)) {
                 Mapping m = ws.new Mapping();
                 assert m.size() == ws.works.size();   // just so that you the reader of the source code don't get confused with the for loop index
-
-                if (assignGreedily(m, task, hashes, 0)) {
+                if (assignEvenly(ws, m, task, 0)) {
                     assert m.isCompletelyValid();
                     return m;
                 } else {
-                    LOGGER.log(FINE, "Least load balancer was unable to define mapping. Falling back to double check");
-                    return getFallBackLoadBalancer().map(task, ws);
+                    return null; // Maybe there are no free executors.
                 }
 
             } else {
@@ -125,23 +106,36 @@ public class LeastLoadBalancer extends LoadBalancer {
             return getFallBackLoadBalancer().map(task, ws);
         }
     }
-
-    /**
-     * Extract a list of applicable {@link ExecutorChunk}s sorted in least loaded order
-     *
-     * @param ws - The mapping worksheet
-     * @return -A list of ExecutorChunk in least loaded order
-     */
-    private List<ExecutorChunk> getApplicableSortedByLoad(MappingWorksheet ws) {
-
-        List<ExecutorChunk> chunks = new ArrayList<>();
-        for (int i = 0; i < ws.works.size(); i++) {
-            chunks.addAll(ws.works(i).applicableExecutorChunks());
+    private boolean assignEvenly(MappingWorksheet ws, Mapping m, Task task, int i) {
+        if (i == m.size())
+            return true;    // fully assigned
+        List<ExecutorChunk> aec = ws.works(i).applicableExecutorChunks();
+        Collections.shuffle(aec);
+        List<ExecutorChunk> idles = aec.stream().filter(ae -> ae.computer.isIdle()).collect(Collectors.toList());
+        List<ExecutorChunk> busies = aec.stream().filter(ae -> ae.computer.isPartiallyIdle()).sorted(Comparator.comparingInt(ae -> ae.computer.countBusy())).collect(Collectors.toList());
+        if (assignChunks(ws, m, task, i, 0, idles)) {
+            return true;
         }
-        Collections.shuffle(chunks); // See JENKINS-18323
-        chunks.sort(EXECUTOR_CHUNK_COMPARATOR);
-        return chunks;
+        if (assignChunks(ws, m, task, i, 0, busies)) {
+            return true;
+        }
+        m.assign(i, null);
+        return false;
+    }
 
+    private boolean assignChunks(MappingWorksheet ws, Mapping m, Task task, int i, int start, List<ExecutorChunk> aec) {
+        ArrayList<ExecutorChunk> ae = new ArrayList(aec);
+        int step = 1;//ae.size() / 2 - 1;
+        int sz = ae.size();
+        for (int j = start; j < sz + start; ++j) {
+            ExecutorChunk ec = ae.get((j * step) % sz);
+            m.assign(i, ec);
+            if (m.isPartiallyValid() && assignEvenly(ws, m, task, i + 1))
+                return true;    // successful allocation
+            // otherwise 'ec' wasn't a good fit for us. try next.
+        }
+
+        return false;
     }
 
     private boolean isDisabled(Task task) {
@@ -163,33 +157,6 @@ public class LeastLoadBalancer extends LoadBalancer {
 
     }
 
-    private boolean assignGreedily(Mapping m, Task task, List<ConsistentHash<ExecutorChunk>> hashes, int i) {
-        if (i == hashes.size())   return true;    // fully assigned
-
-        String key;
-        try {
-            key = task.getAffinityKey();
-        } catch (RuntimeException e) {
-            LOGGER.log(Level.FINE, null, e);
-            // Default implementation of Queue.Task.getAffinityKey, we assume it doesn't fail.
-            key = task.getFullDisplayName();
-        }
-        key += i > 0 ? String.valueOf(i) : "";
-
-        for (ExecutorChunk ec : hashes.get(i).list(key)) {
-            // let's attempt this assignment
-            m.assign(i, ec);
-
-            if (m.isPartiallyValid() && assignGreedily(m, task, hashes, i + 1))
-                return true;    // successful greedily allocation
-
-            // otherwise 'ec' wasn't a good fit for us. try next.
-        }
-
-        // every attempt failed
-        m.assign(i, null);
-        return false;
-    }
 
     /**
      * Retrieves the fallback {@link LoadBalancer}
@@ -198,35 +165,5 @@ public class LeastLoadBalancer extends LoadBalancer {
      */
     public LoadBalancer getFallBackLoadBalancer() {
         return fallback;
-    }
-
-    protected static class ExecutorChunkComparator implements Comparator<ExecutorChunk>, Serializable {
-        private static final long serialVersionUID = 1L;
-
-        public int compare(ExecutorChunk ec1, ExecutorChunk ec2) {
-
-            if (ec1 == ec2) {
-                return 0;
-            }
-
-            Computer com1 = ec1.computer;
-            Computer com2 = ec2.computer;
-
-            if (isIdle(com1) && !isIdle(com2)) {
-                return 1;
-            } else if (isIdle(com2) && !isIdle(com1)) {
-                return -1;
-            } else {
-                return com1.countIdle() - com2.countIdle();
-            }
-
-        }
-
-        // Can't use computer.isIdle() as it can return false when assigned
-        // a multi-configuration job even though no executors are being used
-        private boolean isIdle(Computer computer) {
-            return computer.countBusy() == 0;
-        }
-
     }
 }
