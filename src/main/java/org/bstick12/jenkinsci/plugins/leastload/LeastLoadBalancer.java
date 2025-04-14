@@ -37,6 +37,7 @@ import hudson.model.queue.MappingWorksheet.ExecutorChunk;
 import hudson.model.queue.MappingWorksheet.Mapping;
 import hudson.model.queue.SubTask;
 
+import java.io.IOException;
 import java.io.Serializable;
 import java.util.*;
 import java.util.logging.Level;
@@ -46,9 +47,7 @@ import hudson.util.ConsistentHash;
 import jenkins.model.Jenkins;
 import jenkins.util.SystemProperties;
 import org.apache.tools.ant.taskdefs.Exec;
-
-import static java.util.logging.Level.FINE;
-import static java.util.logging.Level.WARNING;
+import static java.util.logging.Level.*;
 
 /**
  * A {@link LoadBalancer} implementation that the leastload plugin uses to replace the default
@@ -106,11 +105,34 @@ public class LeastLoadBalancer extends LoadBalancer {
             return getFallBackLoadBalancer().map(task, ws);
         }
     }
+    static long lastLogNs = 0;
     private boolean assignEvenly(MappingWorksheet ws, Mapping m, Task task, int i) {
         if (i == m.size())
             return true;    // fully assigned
         List<ExecutorChunk> aec = ws.works(i).applicableExecutorChunks();
         Collections.shuffle(aec);
+        final int prioLevels = 2;
+        for (int j = 1; j <= prioLevels; ++j) {
+            final int j2 = j;
+            List<ExecutorChunk> prios = aec.stream().filter(ae -> {
+                if (!ae.computer.isIdle() && !ae.computer.isPartiallyIdle()) {
+                    return false;
+                }
+                try {
+                    String v = ae.computer.getEnvironment().getOrDefault("LEAST_LOAD_PRIO", null);
+                    return v != null && Integer.parseInt(v) <= j2;
+                } catch (Exception e) {
+                    if (System.nanoTime() - lastLogNs > 10000000000l) {
+                        LOGGER.log(SEVERE, "Failed to get computer " + ae.computer.getName() + " environment for prioritization.", e);
+                        lastLogNs = System.nanoTime();
+                    }
+                }
+                return false;
+            }).collect(Collectors.toList());
+            if (assignChunks(ws, m, task, i, 0, prios)) {
+                return true;
+            }
+       }
         List<ExecutorChunk> idles = aec.stream().filter(ae -> ae.computer.isIdle()).collect(Collectors.toList());
         List<ExecutorChunk> busies = aec.stream().filter(ae -> ae.computer.isPartiallyIdle()).sorted(Comparator.comparingInt(ae -> ae.computer.countBusy())).collect(Collectors.toList());
         if (assignChunks(ws, m, task, i, 0, idles)) {
