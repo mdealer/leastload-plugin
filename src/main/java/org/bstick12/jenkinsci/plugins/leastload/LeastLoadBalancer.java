@@ -26,11 +26,8 @@ package org.bstick12.jenkinsci.plugins.leastload;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
-import hudson.init.Initializer;
-import hudson.model.Computer;
-import hudson.model.Executor;
-import hudson.model.Job;
-import hudson.model.LoadBalancer;
+import hudson.EnvVars;import hudson.init.Initializer;
+import hudson.model.*;
 import hudson.model.Queue.Task;
 import hudson.model.queue.MappingWorksheet;
 import hudson.model.queue.MappingWorksheet.ExecutorChunk;
@@ -43,7 +40,7 @@ import java.util.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
-import hudson.util.ConsistentHash;
+import hudson.slaves.NodeProperty;import hudson.util.ConsistentHash;
 import jenkins.model.Jenkins;
 import jenkins.util.SystemProperties;
 import org.apache.tools.ant.taskdefs.Exec;
@@ -105,6 +102,24 @@ public class LeastLoadBalancer extends LoadBalancer {
             return getFallBackLoadBalancer().map(task, ws);
         }
     }
+    @NonNull
+    public EnvVars buildNodeEnvironment(hudson.model.Computer comp) {
+        // This is more efficient than computer.buildEnvironment.
+        EnvVars env = new EnvVars();
+        try {
+            Iterator var4 = comp.getNode().getNodeProperties().iterator();
+            while(var4.hasNext()) {
+                NodeProperty np = (NodeProperty)var4.next();
+                np.buildEnvVars(env, hudson.model.TaskListener.NULL);
+            }
+        } catch (Exception e) {
+             if (System.nanoTime() - lastLogNs > 10000000000l) {
+                 LOGGER.log(SEVERE, "Failed to get computer " + comp.getName() + " environment for prioritization.", e);
+                 lastLogNs = System.nanoTime();
+             }
+        }
+        return env;
+    }
     static long lastLogNs = 0;
     private boolean assignEvenly(MappingWorksheet ws, Mapping m, Task task, int i) {
         if (i == m.size())
@@ -119,8 +134,18 @@ public class LeastLoadBalancer extends LoadBalancer {
                     return false;
                 }
                 try {
-                    String v = ae.computer.getEnvironment().getOrDefault("LEAST_LOAD_PRIO", null);
-                    return v != null && Integer.parseInt(v) <= j2;
+                    // Labels are more efficient.
+                    String v = ae.computer.getNode().getLabelString();
+                    if (v.contains("NODE_PRIO_1")) {
+                        return 1 <= j2;
+                    }
+                    if (v.contains("NODE_PRIO_2")) {
+                        return 2 <= j2;
+                    }
+                    return false;
+                    //String v = ae.computer.buildEnvironment(hudson.model.TaskListener.NULL).getOrDefault("LEAST_LOAD_PRIO", null);
+                    //String v = buildNodeEnvironment(ae.computer).getOrDefault("LEAST_LOAD_PRIO", null);
+                    //return v != null && Integer.parseInt(v) <= j2;
                 } catch (Exception e) {
                     if (System.nanoTime() - lastLogNs > 10000000000l) {
                         LOGGER.log(SEVERE, "Failed to get computer " + ae.computer.getName() + " environment for prioritization.", e);
@@ -132,7 +157,7 @@ public class LeastLoadBalancer extends LoadBalancer {
             if (assignChunks(ws, m, task, i, 0, prios)) {
                 return true;
             }
-       }
+        }
         List<ExecutorChunk> idles = aec.stream().filter(ae -> ae.computer.isIdle()).collect(Collectors.toList());
         List<ExecutorChunk> busies = aec.stream().filter(ae -> ae.computer.isPartiallyIdle()).sorted(Comparator.comparingInt(ae -> ae.computer.countBusy())).collect(Collectors.toList());
         if (assignChunks(ws, m, task, i, 0, idles)) {
